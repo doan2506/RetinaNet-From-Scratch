@@ -120,15 +120,15 @@ class DetectionTransforms:
         shifted_boxes[:, 2] += left
         shifted_boxes[:, 3] += top
 
-        image = canvas
-        width, height = new_w, new_h
+        expanded_image = canvas
+        exp_w, exp_h = new_w, new_h
 
         # Random crop: ensure at least one box center is inside crop
         for _ in range(50):  # max attempts
-            crop_w = random.randint(int(0.5 * width), width)
-            crop_h = random.randint(int(0.5 * height), height)
-            crop_x = random.randint(0, width - crop_w)
-            crop_y = random.randint(0, height - crop_h)
+            crop_w = random.randint(int(0.5 * exp_w), exp_w)
+            crop_h = random.randint(int(0.5 * exp_h), exp_h)
+            crop_x = random.randint(0, exp_w - crop_w)
+            crop_y = random.randint(0, exp_h - crop_h)
 
             # Check if at least one box center is inside crop
             centers_x = (shifted_boxes[:, 0] + shifted_boxes[:, 2]) / 2.0
@@ -141,9 +141,6 @@ class DetectionTransforms:
             )
 
             if inside.any():
-                # Perform the crop
-                image = image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
-
                 # Adjust boxes to crop coordinates and filter
                 cropped_boxes = shifted_boxes.clone()
                 cropped_boxes[:, 0] = (cropped_boxes[:, 0] - crop_x).clamp(min=0, max=crop_w)
@@ -154,7 +151,10 @@ class DetectionTransforms:
                 # Keep only boxes that are still valid and whose center was inside
                 valid = inside & (cropped_boxes[:, 2] > cropped_boxes[:, 0] + 2) & (cropped_boxes[:, 3] > cropped_boxes[:, 1] + 2)
                 if valid.any():
-                    return image, cropped_boxes[valid], labels[valid]
-                break
+                    # Only crop image AFTER confirming valid boxes exist
+                    cropped_image = expanded_image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+                    return cropped_image, cropped_boxes[valid], labels[valid]
 
-        return image, shifted_boxes, labels
+        # Fallback: return expanded image with shifted boxes (no crop applied)
+        return expanded_image, shifted_boxes, labels
+

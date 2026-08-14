@@ -72,8 +72,9 @@ class RetinaNet(nn.Module):
 
     def _compute_losses(self, cls_logits: torch.Tensor, reg_deltas: torch.Tensor, anchors: torch.Tensor, targets: list):
         batch_size = cls_logits.shape[0]
-        total_cls_loss = 0.0
-        total_reg_loss = 0.0
+        device = cls_logits.device
+        total_cls_loss = torch.tensor(0.0, device=device)
+        total_reg_loss = torch.tensor(0.0, device=device)
         total_positives = 0
 
         for b in range(batch_size):

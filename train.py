@@ -1,5 +1,7 @@
 import os
+import sys
 import json
+import random
 import argparse
 import subprocess
 import time
@@ -160,14 +162,15 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, schedul
 
 @torch.no_grad()
 def validate_loss(model, dataloader, device):
-    model.eval()
+    raw_model = model.module if hasattr(model, "module") else model
+    raw_model.eval()
     val_loss = 0.0
     val_cls = 0.0
     val_reg = 0.0
 
     for images, targets in dataloader:
         images = images.to(device)
-        loss_dict = model(images, targets)
+        loss_dict = raw_model(images, targets)
         val_loss += loss_dict["loss"].item()
         val_cls += loss_dict["loss_cls"].item()
         val_reg += loss_dict["loss_reg"].item()
@@ -230,7 +233,7 @@ def evaluate_map(model, dataloader, device, val_ann_path, img_size, output_dir):
     if os.path.exists(eval_script):
         try:
             result = subprocess.run(
-                ["python", eval_script,
+                [sys.executable, eval_script,
                  "--ground_truth", val_ann_path,
                  "--predictions", pred_path,
                  "--output", score_path],
@@ -276,6 +279,11 @@ def main():
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed else None
 
+    # Seed workers for reproducible augmentation randomness
+    def worker_init_fn(worker_id):
+        worker_seed = torch.initial_seed() % (2**32)
+        random.seed(worker_seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -285,6 +293,7 @@ def main():
         collate_fn=detection_collate_fn,
         pin_memory=(device.type == "cuda"),
         drop_last=True,
+        worker_init_fn=worker_init_fn,
     )
 
     val_loader = DataLoader(
