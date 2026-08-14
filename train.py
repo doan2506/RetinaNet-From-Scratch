@@ -3,6 +3,7 @@ import json
 import argparse
 import subprocess
 import time
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
@@ -23,14 +24,14 @@ def parse_args():
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate for heads/FPN")
+    parser.add_argument("--backbone_lr_ratio", type=float, default=0.1, help="LR multiplier for backbone fine-tuning")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--backbone", type=str, default="resnet50", choices=["resnet34", "resnet50"], help="Backbone architecture")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader num workers")
     parser.add_argument("--img_size", type=int, default=640, help="Target image square size for training")
 
     # Advanced training options
-    parser.add_argument("--freeze_backbone_epochs", type=int, default=2, help="Number of epochs to freeze backbone at start")
     parser.add_argument("--warmup_iters", type=int, default=500, help="Number of warmup iterations for LR")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Max gradient norm for clipping")
     return parser.parse_args()
@@ -52,7 +53,8 @@ def setup_distributed():
 
     if is_distributed:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        # Set 30-minute timeout for NCCL collective operations to prevent timeout during validation
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,52 +68,36 @@ def cleanup_distributed(is_distributed):
 
 
 # ---------------------------------------------------------------------------
-# Learning Rate Warmup Scheduler
+# Learning Rate Warmup Scheduler (Multi-Parameter Groups)
 # ---------------------------------------------------------------------------
 
 class WarmupCosineScheduler:
     """
     Linear warmup for `warmup_iters` steps, then cosine annealing.
+    Supports differential learning rates across multiple parameter groups.
     """
 
-    def __init__(self, optimizer, warmup_iters, total_iters, base_lr):
+    def __init__(self, optimizer, warmup_iters, total_iters, base_lrs=None):
         self.optimizer = optimizer
         self.warmup_iters = warmup_iters
         self.total_iters = total_iters
-        self.base_lr = base_lr
+        if base_lrs is None:
+            self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+        else:
+            self.base_lrs = base_lrs
         self.current_iter = 0
 
     def step(self):
         self.current_iter += 1
         if self.current_iter <= self.warmup_iters:
-            lr = self.base_lr * (self.current_iter / max(self.warmup_iters, 1))
+            factor = self.current_iter / max(self.warmup_iters, 1)
         else:
             progress = (self.current_iter - self.warmup_iters) / max(self.total_iters - self.warmup_iters, 1)
             import math
-            lr = self.base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+            factor = 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
-
-
-# ---------------------------------------------------------------------------
-# Backbone Freezing / Unfreezing
-# ---------------------------------------------------------------------------
-
-def freeze_backbone(model, rank=0):
-    raw_model = model.module if hasattr(model, "module") else model
-    for param in raw_model.backbone.parameters():
-        param.requires_grad = False
-    if is_main_process(rank):
-        print("[INFO] Backbone frozen.")
-
-
-def unfreeze_backbone(model, rank=0):
-    raw_model = model.module if hasattr(model, "module") else model
-    for param in raw_model.backbone.parameters():
-        param.requires_grad = True
-    if is_main_process(rank):
-        print("[INFO] Backbone unfrozen.")
+        for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            param_group["lr"] = base_lr * factor
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +141,11 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, schedul
 
         if is_main_process(rank) and ((step + 1) % 20 == 0 or (step + 1) == len(dataloader)):
             elapsed = time.time() - start_time
-            current_lr = optimizer.param_groups[0]["lr"]
+            head_lr = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else optimizer.param_groups[0]["lr"]
             print(
                 f"  Epoch [{epoch+1}] Step [{step+1}/{len(dataloader)}] "
                 f"Loss: {loss.item():.4f} (Cls: {cls_loss.item():.4f}, Reg: {reg_loss.item():.4f}) "
-                f"LR: {current_lr:.6f} Time: {elapsed:.1f}s"
+                f"LR: {head_lr:.6f} Time: {elapsed:.1f}s"
             )
 
     epoch_loss = running_loss / len(dataloader)
@@ -316,24 +302,32 @@ def main():
     # Initialize RetinaNet Model
     model = RetinaNet(num_classes=5, backbone_name=args.backbone, pretrained=True).to(device)
 
-    # Freeze backbone for initial epochs
-    if args.freeze_backbone_epochs > 0:
-        freeze_backbone(model, rank=rank)
-
     # Wrap model with DDP if multi-GPU
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
+    # Differential Learning Rates: Backbone gets 10x smaller LR for safe fine-tuning
+    raw_model = model.module if is_distributed else model
+    backbone_params = list(raw_model.backbone.parameters())
+    head_params = [p for n, p in raw_model.named_parameters() if not n.startswith("backbone")]
+
+    effective_base_lr = args.lr * world_size
+    effective_backbone_lr = effective_base_lr * args.backbone_lr_ratio
+
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr * world_size,  # Linear scaling rule for multi-GPU
+        [
+            {"params": backbone_params, "lr": effective_backbone_lr},
+            {"params": head_params, "lr": effective_base_lr},
+        ],
         weight_decay=args.weight_decay,
     )
 
     total_iters = args.epochs * len(train_loader)
     scheduler_iter = WarmupCosineScheduler(
-        optimizer, warmup_iters=args.warmup_iters,
-        total_iters=total_iters, base_lr=args.lr * world_size,
+        optimizer,
+        warmup_iters=args.warmup_iters,
+        total_iters=total_iters,
+        base_lrs=[effective_backbone_lr, effective_base_lr],
     )
 
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
@@ -346,8 +340,8 @@ def main():
         print("=" * 70)
         print("Starting training pipeline...")
         print(f"  GPUs: {world_size}, Batch per GPU: {args.batch_size} (Total Batch: {args.batch_size * world_size})")
-        print(f"  Epochs: {args.epochs}, Effective LR: {args.lr * world_size:.6f}")
-        print(f"  Backbone: {args.backbone}, Freeze epochs: {args.freeze_backbone_epochs}")
+        print(f"  Epochs: {args.epochs}")
+        print(f"  Heads Base LR: {effective_base_lr:.6f} | Backbone LR: {effective_backbone_lr:.6f}")
         print(f"  Warmup iters: {args.warmup_iters}, Grad clip: {args.grad_clip}")
         print(f"  Multi-scale training: ON, Image size: {args.img_size}")
         print("=" * 70)
@@ -355,21 +349,6 @@ def main():
     for epoch in range(args.epochs):
         if is_distributed:
             train_sampler.set_epoch(epoch)
-
-        # Unfreeze backbone after freeze period
-        if epoch == args.freeze_backbone_epochs and args.freeze_backbone_epochs > 0:
-            unfreeze_backbone(model, rank=rank)
-            raw_model = model.module if hasattr(model, "module") else model
-            optimizer = torch.optim.AdamW(
-                raw_model.parameters(), lr=args.lr * 0.1 * world_size, weight_decay=args.weight_decay
-            )
-            remaining_iters = (args.epochs - epoch) * len(train_loader)
-            scheduler_iter = WarmupCosineScheduler(
-                optimizer, warmup_iters=200,
-                total_iters=remaining_iters, base_lr=args.lr * 0.1 * world_size,
-            )
-            if is_main_process(rank):
-                print(f"[INFO] Optimizer re-created with all parameters, LR reset with warmup.")
 
         if is_main_process(rank):
             print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
@@ -424,6 +403,7 @@ def main():
                 )
                 print(f"  → Saved best checkpoint to {best_ckpt_path}")
 
+        # Synchronize ranks across epochs safely
         if is_distributed:
             dist.barrier()
 
