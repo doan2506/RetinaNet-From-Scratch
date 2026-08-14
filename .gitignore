@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and model weights
+*.pth
+*.pt
+*.ckpt
+models/best.pth
+models/*.pth
+checkpoints/
+
+# Prediction outputs and scores
+predictions.json
+val_predictions.json
+val_score.json
+*_predictions*.json
+*_score*.json
+_val_*_tmp.json
+
+# Large dataset image files (kept on local/kaggle only)
+public/train/images/
+public/val/images/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# Preserve structural files in public
+!public/classes.json
+!public/annotations/
+!public/tools/
+
+# Temporary test files & caches
+_test_all.py
+_test_imgs/
+*.log
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp

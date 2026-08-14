@@ -1,0 +1,158 @@
+import random
+import torch
+import torchvision.transforms.functional as F
+from PIL import Image
+
+
+# Multi-scale training sizes (randomly picked each sample)
+MULTI_SCALE_SIZES = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+
+
+class DetectionTransforms:
+    """
+    Data augmentation and transformation pipeline for Object Detection.
+    Supports multi-scale training, random horizontal flip, color jitter,
+    random expand+crop, and ImageNet normalization.
+    """
+
+    def __init__(self, target_size=(600, 600), is_train=True, multi_scale=True):
+        self.target_size = target_size  # (height, width) — used as default / for val
+        self.is_train = is_train
+        self.multi_scale = multi_scale and is_train
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
+
+    def __call__(self, image: Image.Image, boxes: torch.Tensor, labels: torch.Tensor):
+        """
+        image: PIL Image
+        boxes: Tensor of shape (N, 4) in [xmin, ymin, xmax, ymax]
+        labels: Tensor of shape (N,)
+        """
+        orig_w, orig_h = image.size
+
+        if self.is_train:
+            # 1. Random Horizontal Flip (50% probability)
+            if random.random() > 0.5:
+                image = F.hflip(image)
+                if len(boxes) > 0:
+                    xmin = boxes[:, 0].clone()
+                    xmax = boxes[:, 2].clone()
+                    boxes[:, 0] = orig_w - xmax
+                    boxes[:, 2] = orig_w - xmin
+
+            # 2. Random Expand + Crop (SSD-style, 40% probability)
+            if random.random() > 0.6 and len(boxes) > 0:
+                image, boxes = self._random_expand_crop(image, boxes)
+                orig_w, orig_h = image.size  # update after expand/crop
+
+            # 3. Random Color Jitter (50% probability, stronger)
+            if random.random() > 0.5:
+                brightness = random.uniform(0.7, 1.3)
+                contrast = random.uniform(0.7, 1.3)
+                saturation = random.uniform(0.7, 1.3)
+                hue = random.uniform(-0.05, 0.05)
+                image = F.adjust_brightness(image, brightness)
+                image = F.adjust_contrast(image, contrast)
+                image = F.adjust_saturation(image, saturation)
+                image = F.adjust_hue(image, hue)
+
+        # Determine target size (multi-scale for training, fixed for val)
+        if self.multi_scale:
+            size = random.choice(MULTI_SCALE_SIZES)
+            target_h, target_w = size, size
+        else:
+            target_h, target_w = self.target_size
+
+        # Resize image to target size
+        image = F.resize(image, [target_h, target_w])
+
+        # Scale bounding boxes according to resize ratios
+        scale_x = target_w / float(orig_w)
+        scale_y = target_h / float(orig_h)
+
+        if len(boxes) > 0:
+            boxes[:, 0] = boxes[:, 0] * scale_x
+            boxes[:, 1] = boxes[:, 1] * scale_y
+            boxes[:, 2] = boxes[:, 2] * scale_x
+            boxes[:, 3] = boxes[:, 3] * scale_y
+
+            # Clamp boxes to image boundaries
+            boxes[:, 0] = boxes[:, 0].clamp(min=0, max=target_w)
+            boxes[:, 1] = boxes[:, 1].clamp(min=0, max=target_h)
+            boxes[:, 2] = boxes[:, 2].clamp(min=0, max=target_w)
+            boxes[:, 3] = boxes[:, 3].clamp(min=0, max=target_h)
+
+            # Filter valid boxes (min 4px each side after resize)
+            valid_mask = (boxes[:, 2] > boxes[:, 0] + 2) & (boxes[:, 3] > boxes[:, 1] + 2)
+            boxes = boxes[valid_mask]
+            labels = labels[valid_mask]
+
+        # Convert to Tensor and normalize
+        image_tensor = F.to_tensor(image)
+        image_tensor = F.normalize(image_tensor, mean=self.mean, std=self.std)
+
+        return image_tensor, boxes, labels, (orig_h, orig_w)
+
+    def _random_expand_crop(self, image: Image.Image, boxes: torch.Tensor):
+        """
+        SSD-style random expand then random crop that guarantees at least one
+        GT box center is kept inside the crop.
+        """
+        width, height = image.size
+
+        # Random expand: place image on a larger canvas (1x to 2x)
+        expand_ratio = random.uniform(1.0, 2.0)
+        new_w = int(width * expand_ratio)
+        new_h = int(height * expand_ratio)
+
+        # Create canvas with mean pixel values
+        mean_pixel = tuple(int(m * 255) for m in self.mean)
+        canvas = Image.new("RGB", (new_w, new_h), mean_pixel)
+
+        # Random offset to place original image
+        left = random.randint(0, new_w - width)
+        top = random.randint(0, new_h - height)
+        canvas.paste(image, (left, top))
+
+        # Shift boxes accordingly
+        boxes[:, 0] += left
+        boxes[:, 1] += top
+        boxes[:, 2] += left
+        boxes[:, 3] += top
+
+        image = canvas
+        width, height = new_w, new_h
+
+        # Random crop: ensure at least one box center is inside crop
+        for _ in range(50):  # max attempts
+            crop_w = random.randint(int(0.5 * width), width)
+            crop_h = random.randint(int(0.5 * height), height)
+            crop_x = random.randint(0, width - crop_w)
+            crop_y = random.randint(0, height - crop_h)
+
+            # Check if at least one box center is inside crop
+            centers_x = (boxes[:, 0] + boxes[:, 2]) / 2.0
+            centers_y = (boxes[:, 1] + boxes[:, 3]) / 2.0
+            inside = (
+                (centers_x >= crop_x)
+                & (centers_x <= crop_x + crop_w)
+                & (centers_y >= crop_y)
+                & (centers_y <= crop_y + crop_h)
+            )
+
+            if inside.any():
+                # Perform the crop
+                image = image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+
+                # Adjust boxes to crop coordinates and filter
+                boxes[:, 0] = (boxes[:, 0] - crop_x).clamp(min=0, max=crop_w)
+                boxes[:, 1] = (boxes[:, 1] - crop_y).clamp(min=0, max=crop_h)
+                boxes[:, 2] = (boxes[:, 2] - crop_x).clamp(min=0, max=crop_w)
+                boxes[:, 3] = (boxes[:, 3] - crop_y).clamp(min=0, max=crop_h)
+
+                # Keep only boxes that are still valid and whose center was inside
+                valid = inside & (boxes[:, 2] > boxes[:, 0] + 2) & (boxes[:, 3] > boxes[:, 1] + 2)
+                boxes = boxes[valid]
+                break
+
+        return image, boxes
