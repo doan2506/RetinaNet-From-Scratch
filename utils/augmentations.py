@@ -30,19 +30,18 @@ class DetectionTransforms:
         """
         orig_w, orig_h = image.size
 
-        if self.is_train:
+        if self.is_train and len(boxes) > 0:
             # 1. Random Horizontal Flip (50% probability)
             if random.random() > 0.5:
                 image = F.hflip(image)
-                if len(boxes) > 0:
-                    xmin = boxes[:, 0].clone()
-                    xmax = boxes[:, 2].clone()
-                    boxes[:, 0] = orig_w - xmax
-                    boxes[:, 2] = orig_w - xmin
+                xmin = boxes[:, 0].clone()
+                xmax = boxes[:, 2].clone()
+                boxes[:, 0] = orig_w - xmax
+                boxes[:, 2] = orig_w - xmin
 
             # 2. Random Expand + Crop (SSD-style, 40% probability)
             if random.random() > 0.6 and len(boxes) > 0:
-                image, boxes = self._random_expand_crop(image, boxes)
+                image, boxes, labels = self._random_expand_crop(image, boxes, labels)
                 orig_w, orig_h = image.size  # update after expand/crop
 
             # 3. Random Color Jitter (50% probability, stronger)
@@ -82,7 +81,7 @@ class DetectionTransforms:
             boxes[:, 2] = boxes[:, 2].clamp(min=0, max=target_w)
             boxes[:, 3] = boxes[:, 3].clamp(min=0, max=target_h)
 
-            # Filter valid boxes (min 4px each side after resize)
+            # Filter valid boxes (min 2px each side after resize)
             valid_mask = (boxes[:, 2] > boxes[:, 0] + 2) & (boxes[:, 3] > boxes[:, 1] + 2)
             boxes = boxes[valid_mask]
             labels = labels[valid_mask]
@@ -93,10 +92,10 @@ class DetectionTransforms:
 
         return image_tensor, boxes, labels, (orig_h, orig_w)
 
-    def _random_expand_crop(self, image: Image.Image, boxes: torch.Tensor):
+    def _random_expand_crop(self, image: Image.Image, boxes: torch.Tensor, labels: torch.Tensor):
         """
         SSD-style random expand then random crop that guarantees at least one
-        GT box center is kept inside the crop.
+        GT box center is kept inside the crop, keeping boxes and labels synchronized.
         """
         width, height = image.size
 
@@ -115,10 +114,11 @@ class DetectionTransforms:
         canvas.paste(image, (left, top))
 
         # Shift boxes accordingly
-        boxes[:, 0] += left
-        boxes[:, 1] += top
-        boxes[:, 2] += left
-        boxes[:, 3] += top
+        shifted_boxes = boxes.clone()
+        shifted_boxes[:, 0] += left
+        shifted_boxes[:, 1] += top
+        shifted_boxes[:, 2] += left
+        shifted_boxes[:, 3] += top
 
         image = canvas
         width, height = new_w, new_h
@@ -131,8 +131,8 @@ class DetectionTransforms:
             crop_y = random.randint(0, height - crop_h)
 
             # Check if at least one box center is inside crop
-            centers_x = (boxes[:, 0] + boxes[:, 2]) / 2.0
-            centers_y = (boxes[:, 1] + boxes[:, 3]) / 2.0
+            centers_x = (shifted_boxes[:, 0] + shifted_boxes[:, 2]) / 2.0
+            centers_y = (shifted_boxes[:, 1] + shifted_boxes[:, 3]) / 2.0
             inside = (
                 (centers_x >= crop_x)
                 & (centers_x <= crop_x + crop_w)
@@ -145,14 +145,16 @@ class DetectionTransforms:
                 image = image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
 
                 # Adjust boxes to crop coordinates and filter
-                boxes[:, 0] = (boxes[:, 0] - crop_x).clamp(min=0, max=crop_w)
-                boxes[:, 1] = (boxes[:, 1] - crop_y).clamp(min=0, max=crop_h)
-                boxes[:, 2] = (boxes[:, 2] - crop_x).clamp(min=0, max=crop_w)
-                boxes[:, 3] = (boxes[:, 3] - crop_y).clamp(min=0, max=crop_h)
+                cropped_boxes = shifted_boxes.clone()
+                cropped_boxes[:, 0] = (cropped_boxes[:, 0] - crop_x).clamp(min=0, max=crop_w)
+                cropped_boxes[:, 1] = (cropped_boxes[:, 1] - crop_y).clamp(min=0, max=crop_h)
+                cropped_boxes[:, 2] = (cropped_boxes[:, 2] - crop_x).clamp(min=0, max=crop_w)
+                cropped_boxes[:, 3] = (cropped_boxes[:, 3] - crop_y).clamp(min=0, max=crop_h)
 
                 # Keep only boxes that are still valid and whose center was inside
-                valid = inside & (boxes[:, 2] > boxes[:, 0] + 2) & (boxes[:, 3] > boxes[:, 1] + 2)
-                boxes = boxes[valid]
+                valid = inside & (cropped_boxes[:, 2] > cropped_boxes[:, 0] + 2) & (cropped_boxes[:, 3] > cropped_boxes[:, 1] + 2)
+                if valid.any():
+                    return image, cropped_boxes[valid], labels[valid]
                 break
 
-        return image, boxes
+        return image, shifted_boxes, labels
