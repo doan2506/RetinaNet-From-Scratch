@@ -143,6 +143,13 @@ class RetinaNet(nn.Module):
             decoded_boxes = box_decode(selected_anchors, selected_deltas)
             decoded_boxes = clip_boxes(decoded_boxes, img_shape)
 
+            # Keep top 1000 candidate detections per image before NMS for fast processing
+            if len(scores) > 1000:
+                topk_scores, topk_idx = torch.topk(scores, 1000)
+                decoded_boxes = decoded_boxes[topk_idx]
+                scores = topk_scores
+                class_indices = class_indices[topk_idx]
+
             # Apply Per-class Non-Maximum Suppression (NMS)
             keep_nms_indices = batched_nms(
                 decoded_boxes, scores, class_indices, self.nms_threshold
