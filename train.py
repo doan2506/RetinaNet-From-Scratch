@@ -10,18 +10,21 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
+
 from models.retinanet import RetinaNet
 from utils.dataset import ObjectDetectionDataset, IDX_TO_CLASS, detection_collate_fn
 from utils.augmentations import DetectionTransforms
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RetinaNet Training Script from Scratch (Supports Multi-GPU DDP)")
+    parser = argparse.ArgumentParser(description="RetinaNet Training Script from Scratch (Supports Multi-GPU DDP & TensorBoard)")
     parser.add_argument("--train_data", type=str, default="./public/annotations/train.json", help="Path to train annotation JSON")
     parser.add_argument("--val_data", type=str, default="./public/annotations/val.json", help="Path to val annotation JSON")
     parser.add_argument("--image_dir", type=str, default="./public/train/images", help="Path to train images directory")
     parser.add_argument("--val_image_dir", type=str, default="./public/val/images", help="Path to val images directory")
     parser.add_argument("--checkpoint_dir", type=str, default="./models/", help="Directory to save checkpoints")
+    parser.add_argument("--log_dir", type=str, default="./runs/", help="Directory to save TensorBoard logs")
 
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
@@ -36,6 +39,7 @@ def parse_args():
     # Advanced training options
     parser.add_argument("--warmup_iters", type=int, default=500, help="Number of warmup iterations for LR")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Max gradient norm for clipping")
+    parser.add_argument("--no_tensorboard", action="store_true", help="Disable TensorBoard logging")
     return parser.parse_args()
 
 
@@ -106,7 +110,7 @@ class WarmupCosineScheduler:
 # Training Loop
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, scheduler_iter, grad_clip, rank=0):
+def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, scheduler_iter, grad_clip, rank=0, writer=None):
     model.train()
     running_loss = 0.0
     running_cls_loss = 0.0
@@ -141,9 +145,20 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, schedul
         running_cls_loss += cls_loss.item()
         running_reg_loss += reg_loss.item()
 
+        head_lr = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else optimizer.param_groups[0]["lr"]
+        backbone_lr = optimizer.param_groups[0]["lr"]
+
+        # Log per-step metrics to TensorBoard
+        if writer is not None and is_main_process(rank):
+            global_step = epoch * len(dataloader) + step
+            writer.add_scalar("Train_Step/Loss", loss.item(), global_step)
+            writer.add_scalar("Train_Step/Cls_Loss", cls_loss.item(), global_step)
+            writer.add_scalar("Train_Step/Reg_Loss", reg_loss.item(), global_step)
+            writer.add_scalar("Train_Step/LR_Head", head_lr, global_step)
+            writer.add_scalar("Train_Step/LR_Backbone", backbone_lr, global_step)
+
         if is_main_process(rank) and ((step + 1) % 20 == 0 or (step + 1) == len(dataloader)):
             elapsed = time.time() - start_time
-            head_lr = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else optimizer.param_groups[0]["lr"]
             print(
                 f"  Epoch [{epoch+1}] Step [{step+1}/{len(dataloader)}] "
                 f"Loss: {loss.item():.4f} (Cls: {cls_loss.item():.4f}, Reg: {reg_loss.item():.4f}) "
@@ -263,6 +278,15 @@ def main():
         os.makedirs(args.checkpoint_dir, exist_ok=True)
     best_ckpt_path = os.path.join(args.checkpoint_dir, "best.pth")
 
+    # Initialize TensorBoard SummaryWriter on main process
+    writer = None
+    if is_main_process(rank) and not args.no_tensorboard:
+        run_name = time.strftime("retinanet_%Y%m%d_%H%M%S")
+        log_dir = os.path.join(args.log_dir, run_name)
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"📊 TensorBoard logging initialized at: {log_dir}")
+
     if is_main_process(rank):
         print(f"Device: {device} | Distributed: {is_distributed} (World Size: {world_size})")
 
@@ -309,7 +333,7 @@ def main():
         print(f"Loaded {len(train_dataset)} training samples, {len(val_dataset)} validation samples.")
 
     # Initialize RetinaNet Model
-    model = RetinaNet(num_classes=5, backbone_name=args.backbone, pretrained=True).to(device)
+    model = RetinaNet(num_classes=len(train_dataset.classes), backbone_name=args.backbone, pretrained=True).to(device)
 
     # Wrap model with DDP if multi-GPU
     if is_distributed:
@@ -364,7 +388,7 @@ def main():
 
         train_loss, train_cls, train_reg = train_one_epoch(
             model, train_loader, optimizer, scaler, device, epoch,
-            scheduler_iter, args.grad_clip, rank=rank,
+            scheduler_iter, args.grad_clip, rank=rank, writer=writer,
         )
 
         # Validation & checkpointing only on main process
@@ -379,6 +403,17 @@ def main():
             val_map = evaluate_map(
                 model, val_loader, device, args.val_data, args.img_size, args.checkpoint_dir
             )
+
+            # Log per-epoch metrics to TensorBoard
+            if writer is not None:
+                writer.add_scalar("Epoch/Train_Loss", train_loss, epoch + 1)
+                writer.add_scalar("Epoch/Train_Cls_Loss", train_cls, epoch + 1)
+                writer.add_scalar("Epoch/Train_Reg_Loss", train_reg, epoch + 1)
+                writer.add_scalar("Epoch/Val_Loss", val_loss, epoch + 1)
+                writer.add_scalar("Epoch/Val_Cls_Loss", val_cls, epoch + 1)
+                writer.add_scalar("Epoch/Val_Reg_Loss", val_reg, epoch + 1)
+                if val_map is not None:
+                    writer.add_scalar("Epoch/Val_mAP50", val_map, epoch + 1)
 
             should_save = False
 
@@ -406,6 +441,7 @@ def main():
                         "optimizer_state_dict": optimizer.state_dict(),
                         "best_val_loss": val_loss,
                         "best_map": val_map if val_map is not None else -1,
+                        "classes": train_dataset.classes,
                         "args": vars(args),
                     },
                     best_ckpt_path,
@@ -422,6 +458,10 @@ def main():
         if best_metric > 0:
             print(f"Best mAP@0.5: {best_metric:.4f}")
         print("=" * 70)
+
+        if writer is not None:
+            writer.close()
+            print(f"📊 TensorBoard log saved to {writer.log_dir}")
 
     cleanup_distributed(is_distributed)
 

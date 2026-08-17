@@ -2,12 +2,17 @@ import os
 import glob
 import json
 import argparse
+import urllib.request
 import torch
 import torchvision.transforms.functional as F
 from PIL import Image
 from models.retinanet import RetinaNet
-from utils.dataset import IDX_TO_CLASS
+from utils.dataset import CLASSES, IDX_TO_CLASS
 from utils.nms import batched_nms
+
+
+# Default direct download URL for best.pth (can be set to your public Google Drive, GitHub Release, or Hugging Face link)
+DEFAULT_WEIGHTS_URL = "https://github.com/doan2506/RetinaNet-From-Scratch/releases/download/v1.0/best.pth"
 
 
 def parse_args():
@@ -15,6 +20,7 @@ def parse_args():
     parser.add_argument("--image_dir", type=str, required=True, help="Directory containing images for inference")
     parser.add_argument("--output", type=str, default="predictions.json", help="Output JSON path")
     parser.add_argument("--model_path", type=str, default="./models/best.pth", help="Path to model checkpoint")
+    parser.add_argument("--weights_url", type=str, default=DEFAULT_WEIGHTS_URL, help="URL to download weights if model_path is missing")
     parser.add_argument("--backbone", type=str, default="resnet50", choices=["resnet34", "resnet50"], help="Backbone architecture")
     parser.add_argument("--conf_thresh", type=float, default=0.05, help="Confidence score threshold")
     parser.add_argument("--nms_thresh", type=float, default=0.5, help="NMS IoU threshold")
@@ -24,9 +30,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(model_path: str, backbone: str, conf_thresh: float, nms_thresh: float, device: torch.device):
+def download_weights(url: str, dest_path: str):
+    """
+    Auto-downloads weights if not found locally, as required by the submission guidelines.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    print(f"📥 Checkpoint not found at {dest_path}. Automatically downloading from:\n   {url} ...")
+    try:
+        urllib.request.urlretrieve(url, dest_path)
+        print(f"✅ Successfully downloaded weights to {dest_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to auto-download weights from {url}: {e}")
+        print("   Please make sure the checkpoint is available or provide a valid --weights_url.")
+
+
+def load_model(model_path: str, backbone: str, conf_thresh: float, nms_thresh: float, device: torch.device, weights_url: str = DEFAULT_WEIGHTS_URL):
+    # Auto-download weights if missing
+    if not os.path.exists(model_path):
+        download_weights(weights_url, model_path)
+
     model = RetinaNet(
-        num_classes=5,
+        num_classes=len(CLASSES),
         backbone_name=backbone,
         pretrained=False,
         conf_threshold=conf_thresh,
@@ -35,8 +59,12 @@ def load_model(model_path: str, backbone: str, conf_thresh: float, nms_thresh: f
 
     if os.path.exists(model_path):
         print(f"Loading checkpoint weights from {model_path}...")
-        checkpoint = torch.load(model_path, map_location=device)
-        if "model_state_dict" in checkpoint:
+        try:
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        except Exception:
+            checkpoint = torch.load(model_path, map_location=device)
+
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"])
         else:
             model.load_state_dict(checkpoint)
@@ -116,7 +144,7 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = load_model(args.model_path, args.backbone, args.conf_thresh, args.nms_thresh, device)
+    model = load_model(args.model_path, args.backbone, args.conf_thresh, args.nms_thresh, device, args.weights_url)
 
     # Gather all image files
     image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG")
@@ -160,7 +188,8 @@ def main():
                 boxes[:, 3] = (boxes[:, 3] * scale_y).clamp(min=0, max=orig_h)
 
                 for box, score, label_idx in zip(boxes, scores, labels):
-                    cls_name = IDX_TO_CLASS[label_idx.item()]
+                    label_num = label_idx.item()
+                    cls_name = IDX_TO_CLASS[label_num] if label_num in IDX_TO_CLASS else CLASSES[label_num]
                     xmin, ymin, xmax, ymax = box.tolist()
 
                     boxes_list.append({
@@ -175,6 +204,10 @@ def main():
             })
 
     # Save to JSON output
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(predictions, f, indent=2, ensure_ascii=False)
 

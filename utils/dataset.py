@@ -3,10 +3,11 @@ import json
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+import torchvision.transforms.functional as TF
 from utils.augmentations import DetectionTransforms
 
 
-CLASSES = ["person", "car", "dog", "cat", "chair"]
+CLASSES = ["bottle", "cup", "chair", "laptop", "backpack"]
 CLASS_TO_IDX = {cls_name: idx for idx, cls_name in enumerate(CLASSES)}
 IDX_TO_CLASS = {idx: cls_name for idx, cls_name in enumerate(CLASSES)}
 
@@ -24,7 +25,9 @@ class ObjectDetectionDataset(Dataset):
             data = json.load(f)
 
         self.classes = data.get("classes", CLASSES)
-        self.images_info = {img["id"]: img for img in data["images"]}
+        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
+        self.idx_to_class = {idx: cls_name for idx, cls_name in enumerate(self.classes)}
+        self.images_info = {img["id"]: img for img in data.get("images", [])}
 
         # Group annotations by image_id
         self.annotations = {}
@@ -50,6 +53,7 @@ class ObjectDetectionDataset(Dataset):
             image_path = os.path.join(self.image_dir, file_name)
 
         image = Image.open(image_path).convert("RGB")
+        orig_w, orig_h = image.size
 
         # Parse ground-truth boxes and labels
         anns = self.annotations.get(img_id, [])
@@ -58,8 +62,8 @@ class ObjectDetectionDataset(Dataset):
 
         for ann in anns:
             cls_name = ann["class"]
-            if cls_name in CLASS_TO_IDX:
-                label = CLASS_TO_IDX[cls_name]
+            if cls_name in self.class_to_idx:
+                label = self.class_to_idx[cls_name]
                 bbox = ann["bbox"]  # [xmin, ymin, xmax, ymax]
                 boxes.append(bbox)
                 labels.append(label)
@@ -76,8 +80,8 @@ class ObjectDetectionDataset(Dataset):
                 image, boxes_tensor, labels_tensor
             )
         else:
-            orig_shape = (image.height, image.width)
-            image_tensor = torch.tensor(list(image.getdata()), dtype=torch.float32)
+            image_tensor = TF.to_tensor(image)
+            orig_shape = (orig_h, orig_w)
 
         target = {
             "boxes": boxes_tensor,
@@ -91,28 +95,30 @@ class ObjectDetectionDataset(Dataset):
 
 def detection_collate_fn(batch):
     """
-    Custom collate function for object detection batching.
-    Handles variable-size images from multi-scale training by padding to max size.
-    batch: list of tuples (image_tensor, target_dict)
+    Collate function to batch multiple images and bounding boxes.
+    Supports multi-scale batches by padding all images in the batch to (max_h, max_w).
     """
-    images = [item[0] for item in batch]
-    targets = [item[1] for item in batch]
+    images, targets = zip(*batch)
 
-    # Check if all images are the same size (common case)
-    sizes = set((img.shape[1], img.shape[2]) for img in images)
-    if len(sizes) == 1:
-        images = torch.stack(images, dim=0)
+    # Check if all images have the same shape
+    heights = [img.shape[1] for img in images]
+    widths = [img.shape[2] for img in images]
+
+    max_h = max(heights)
+    max_w = max(widths)
+
+    if all(h == max_h for h in heights) and all(w == max_w for w in widths):
+        stacked_images = torch.stack(images, dim=0)
     else:
-        # Pad to the max H and W in the batch
-        max_h = max(img.shape[1] for img in images)
-        max_w = max(img.shape[2] for img in images)
-        padded = []
+        # Pad each image to (max_h, max_w) with 0
+        padded_images = []
         for img in images:
-            pad_h = max_h - img.shape[1]
-            pad_w = max_w - img.shape[2]
-            padded_img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), value=0)
-            padded.append(padded_img)
-        images = torch.stack(padded, dim=0)
+            _, h, w = img.shape
+            pad_h = max_h - h
+            pad_w = max_w - w
+            if pad_h > 0 or pad_w > 0:
+                img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), value=0)
+            padded_images.append(img)
+        stacked_images = torch.stack(padded_images, dim=0)
 
-    return images, targets
-
+    return stacked_images, list(targets)
