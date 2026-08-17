@@ -31,20 +31,7 @@ class DetectionTransforms:
         orig_w, orig_h = image.size
 
         if self.is_train and len(boxes) > 0:
-            # 1. Random Horizontal Flip (50% probability)
-            if random.random() > 0.5:
-                image = F.hflip(image)
-                xmin = boxes[:, 0].clone()
-                xmax = boxes[:, 2].clone()
-                boxes[:, 0] = orig_w - xmax
-                boxes[:, 2] = orig_w - xmin
-
-            # 2. Random Expand + Crop (SSD-style, 40% probability)
-            if random.random() > 0.6 and len(boxes) > 0:
-                image, boxes, labels = self._random_expand_crop(image, boxes, labels)
-                orig_w, orig_h = image.size  # update after expand/crop
-
-            # 3. Random Color Jitter (50% probability, stronger)
+            # 1. Random Color Jitter (50% probability - photometric distortion)
             if random.random() > 0.5:
                 brightness = random.uniform(0.7, 1.3)
                 contrast = random.uniform(0.7, 1.3)
@@ -55,7 +42,20 @@ class DetectionTransforms:
                 image = F.adjust_saturation(image, saturation)
                 image = F.adjust_hue(image, hue)
 
-        # Determine target size (multi-scale for training, fixed for val)
+            # 2. Random Expand + Crop (SSD-style, 40% probability)
+            if random.random() > 0.6 and len(boxes) > 0:
+                image, boxes, labels = self._random_expand_crop(image, boxes, labels)
+                orig_w, orig_h = image.size  # update dimensions after expand/crop
+
+            # 3. Random Horizontal Flip (50% probability - spatial geometry)
+            if random.random() > 0.5 and len(boxes) > 0:
+                image = F.hflip(image)
+                xmin = boxes[:, 0].clone()
+                xmax = boxes[:, 2].clone()
+                boxes[:, 0] = orig_w - xmax
+                boxes[:, 2] = orig_w - xmin
+
+        # 4. Resize (Multi-scale for training, fixed for val)
         if self.multi_scale:
             size = random.choice(MULTI_SCALE_SIZES)
             target_h, target_w = size, size
@@ -65,7 +65,7 @@ class DetectionTransforms:
         # Resize image to target size
         image = F.resize(image, [target_h, target_w])
 
-        # Scale bounding boxes according to resize ratios
+        # 5. Scale & Filter Box
         scale_x = target_w / float(orig_w)
         scale_y = target_h / float(orig_h)
 
@@ -86,7 +86,7 @@ class DetectionTransforms:
             boxes = boxes[valid_mask]
             labels = labels[valid_mask]
 
-        # Convert to Tensor and normalize
+        # 6. Normalize (ToTensor and ImageNet normalization)
         image_tensor = F.to_tensor(image)
         image_tensor = F.normalize(image_tensor, mean=self.mean, std=self.std)
 

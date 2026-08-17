@@ -18,8 +18,8 @@ class AnchorGenerator(nn.Module):
         super().__init__()
         self.strides = strides
         self.base_sizes = base_sizes
-        self.ratios = torch.tensor(ratios)
-        self.scales = torch.tensor(scales)
+        self.register_buffer("ratios", torch.tensor(ratios, dtype=torch.float32))
+        self.register_buffer("scales", torch.tensor(scales, dtype=torch.float32))
         self.num_anchors_per_location = len(ratios) * len(scales)
 
     def _generate_base_anchors(self, base_size: float, device: torch.device) -> torch.Tensor:
@@ -27,8 +27,8 @@ class AnchorGenerator(nn.Module):
         Generates 9 base anchors centered at (0, 0) for a given base size.
         Returns: Tensor (9, 4) in [xmin, ymin, xmax, ymax]
         """
-        ratios = self.ratios.to(device)
-        scales = self.scales.to(device)
+        ratios = self.ratios
+        scales = self.scales
 
         # Calculate heights and widths for all (scale, ratio) combinations
         aspect_ratios = torch.sqrt(ratios)
