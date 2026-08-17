@@ -10,7 +10,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 from models.retinanet import RetinaNet
 from utils.dataset import ObjectDetectionDataset, IDX_TO_CLASS, detection_collate_fn
@@ -281,11 +284,14 @@ def main():
     # Initialize TensorBoard SummaryWriter on main process
     writer = None
     if is_main_process(rank) and not args.no_tensorboard:
-        run_name = time.strftime("retinanet_%Y%m%d_%H%M%S")
-        log_dir = os.path.join(args.log_dir, run_name)
-        os.makedirs(log_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=log_dir)
-        print(f"📊 TensorBoard logging initialized at: {log_dir}")
+        if SummaryWriter is not None:
+            run_name = time.strftime("retinanet_%Y%m%d_%H%M%S")
+            log_dir = os.path.join(args.log_dir, run_name)
+            os.makedirs(log_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir=log_dir)
+            print(f"TensorBoard logging initialized at: {log_dir}")
+        else:
+            print("[INFO] tensorboard package not found, skipping TensorBoard logging.")
 
     if is_main_process(rank):
         print(f"Device: {device} | Distributed: {is_distributed} (World Size: {world_size})")
