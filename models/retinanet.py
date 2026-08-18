@@ -44,7 +44,7 @@ class RetinaNet(nn.Module):
         self.reg_head = RegressionHead(in_channels=256, num_anchors=num_anchors)
 
         # 4. Losses
-        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0, reduction="sum")
+        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.5, reduction="sum")
         self.reg_loss = BBoxRegressionLoss(reduction="sum")
 
     def forward(self, images: torch.Tensor, targets: list = None):

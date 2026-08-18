@@ -23,10 +23,11 @@ def parse_args():
     parser.add_argument("--weights_url", type=str, default=DEFAULT_WEIGHTS_URL, help="URL to download weights if model_path is missing")
     parser.add_argument("--backbone", type=str, default="resnet50", choices=["resnet34", "resnet50"], help="Backbone architecture")
     parser.add_argument("--conf_thresh", type=float, default=0.05, help="Confidence score threshold")
-    parser.add_argument("--nms_thresh", type=float, default=0.5, help="NMS IoU threshold")
+    parser.add_argument("--nms_thresh", type=float, default=0.45, help="NMS IoU threshold (default: 0.45)")
     parser.add_argument("--img_size", type=int, default=640, help="Inference image resize target")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for faster inference")
-    parser.add_argument("--use_tta", action="store_true", help="Enable Test-Time Augmentation (horizontal flip) for higher mAP")
+    parser.add_argument("--use_tta", action="store_true", default=True, help="Enable Test-Time Augmentation (default: True)")
+    parser.add_argument("--no_tta", dest="use_tta", action="store_false", help="Disable Test-Time Augmentation")
     return parser.parse_args()
 
 
@@ -128,6 +129,8 @@ def infer_batch(model, batch_tensors, device, use_tta=False):
 
         if len(all_boxes) > 0:
             keep = batched_nms(all_boxes, all_scores, all_labels, model.nms_threshold)
+            if len(keep) > model.max_detections_per_img:
+                keep = keep[: model.max_detections_per_img]
             merged_results.append({
                 "boxes": all_boxes[keep],
                 "scores": all_scores[keep],
