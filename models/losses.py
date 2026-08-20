@@ -9,7 +9,7 @@ class FocalLoss(nn.Module):
     FL(pt) = - alpha_t * (1 - pt)^gamma * log(pt)
     """
 
-    def __init__(self, alpha=0.25, gamma=2.5, reduction="sum"):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction="sum"):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma

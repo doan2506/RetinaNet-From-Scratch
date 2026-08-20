@@ -33,17 +33,17 @@ class DetectionTransforms:
         if self.is_train and len(boxes) > 0:
             # 1. Random Color Jitter (50% probability - photometric distortion)
             if random.random() > 0.5:
-                brightness = random.uniform(0.8, 1.2)
-                contrast = random.uniform(0.2, 1.2)
-                saturation = random.uniform(0.2, 1.2)
+                brightness = random.uniform(0.7, 1.3)
+                contrast = random.uniform(0.7, 1.3)
+                saturation = random.uniform(0.7, 1.3)
                 hue = random.uniform(-0.05, 0.05)
                 image = F.adjust_brightness(image, brightness)
                 image = F.adjust_contrast(image, contrast)
                 image = F.adjust_saturation(image, saturation)
                 image = F.adjust_hue(image, hue)
 
-            # 2. Random Expand + Crop (SSD-style, 30% probability)
-            if random.random() > 0.7 and len(boxes) > 0:
+            # 2. Random Expand + Crop (SSD-style, 40% probability)
+            if random.random() > 0.6 and len(boxes) > 0:
                 image, boxes, labels = self._random_expand_crop(image, boxes, labels)
                 orig_w, orig_h = image.size  # update dimensions after expand/crop
 
@@ -94,13 +94,13 @@ class DetectionTransforms:
 
     def _random_expand_crop(self, image: Image.Image, boxes: torch.Tensor, labels: torch.Tensor):
         """
-        SSD-style random expand then random crop that keeps only boxes
-        retaining at least 50% of their original bbox area, preserving feature integrity.
+        SSD-style random expand then random crop that guarantees at least one
+        GT box center is kept inside the crop, keeping boxes and labels synchronized.
         """
         width, height = image.size
 
-        # 1. Random expand: place image on a moderately larger canvas (1.0x to 1.5x)
-        expand_ratio = random.uniform(1.0, 1.5)
+        # Random expand: place image on a larger canvas (1x to 2x)
+        expand_ratio = random.uniform(1.0, 2.0)
         new_w = int(width * expand_ratio)
         new_h = int(height * expand_ratio)
 
@@ -115,44 +115,45 @@ class DetectionTransforms:
 
         # Shift boxes accordingly
         shifted_boxes = boxes.clone()
-        shifted_boxes[:, [0, 2]] += left
-        shifted_boxes[:, [1, 3]] += top
+        shifted_boxes[:, 0] += left
+        shifted_boxes[:, 1] += top
+        shifted_boxes[:, 2] += left
+        shifted_boxes[:, 3] += top
 
         expanded_image = canvas
         exp_w, exp_h = new_w, new_h
 
-        # Original bbox areas before crop
-        orig_areas = (shifted_boxes[:, 2] - shifted_boxes[:, 0]) * (shifted_boxes[:, 3] - shifted_boxes[:, 1])
-
-        # 2. Random crop: keep 70% to 100% of the canvas size
+        # Random crop: ensure at least one box center is inside crop
         for _ in range(50):  # max attempts
-            crop_w = random.randint(int(0.7 * exp_w), exp_w)
-            crop_h = random.randint(int(0.7 * exp_h), exp_h)
+            crop_w = random.randint(int(0.5 * exp_w), exp_w)
+            crop_h = random.randint(int(0.5 * exp_h), exp_h)
             crop_x = random.randint(0, exp_w - crop_w)
             crop_y = random.randint(0, exp_h - crop_h)
 
-            # Compute intersection coordinates of all boxes with the crop window
-            inter_x1 = torch.clamp(shifted_boxes[:, 0], min=crop_x, max=crop_x + crop_w)
-            inter_y1 = torch.clamp(shifted_boxes[:, 1], min=crop_y, max=crop_y + crop_h)
-            inter_x2 = torch.clamp(shifted_boxes[:, 2], min=crop_x, max=crop_x + crop_w)
-            inter_y2 = torch.clamp(shifted_boxes[:, 3], min=crop_y, max=crop_y + crop_h)
+            # Check if at least one box center is inside crop
+            centers_x = (shifted_boxes[:, 0] + shifted_boxes[:, 2]) / 2.0
+            centers_y = (shifted_boxes[:, 1] + shifted_boxes[:, 3]) / 2.0
+            inside = (
+                (centers_x >= crop_x)
+                & (centers_x <= crop_x + crop_w)
+                & (centers_y >= crop_y)
+                & (centers_y <= crop_y + crop_h)
+            )
 
-            inter_areas = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
-
-            # Coverage condition: retain at least 50% of the original bbox area
-            coverage = inter_areas / (orig_areas + 1e-6)
-            valid_mask = (coverage > 0.50) & ((inter_x2 - inter_x1) > 2) & ((inter_y2 - inter_y1) > 2)
-
-            if valid_mask.any():
-                # Adjust kept boxes to crop coordinates
-                cropped_boxes = shifted_boxes[valid_mask].clone()
+            if inside.any():
+                # Adjust boxes to crop coordinates and filter
+                cropped_boxes = shifted_boxes.clone()
                 cropped_boxes[:, 0] = (cropped_boxes[:, 0] - crop_x).clamp(min=0, max=crop_w)
                 cropped_boxes[:, 1] = (cropped_boxes[:, 1] - crop_y).clamp(min=0, max=crop_h)
                 cropped_boxes[:, 2] = (cropped_boxes[:, 2] - crop_x).clamp(min=0, max=crop_w)
                 cropped_boxes[:, 3] = (cropped_boxes[:, 3] - crop_y).clamp(min=0, max=crop_h)
 
-                cropped_image = expanded_image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
-                return cropped_image, cropped_boxes, labels[valid_mask]
+                # Keep only boxes that are still valid and whose center was inside
+                valid = inside & (cropped_boxes[:, 2] > cropped_boxes[:, 0] + 2) & (cropped_boxes[:, 3] > cropped_boxes[:, 1] + 2)
+                if valid.any():
+                    # Only crop image AFTER confirming valid boxes exist
+                    cropped_image = expanded_image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+                    return cropped_image, cropped_boxes[valid], labels[valid]
 
         # Fallback: return expanded image with shifted boxes (no crop applied)
         return expanded_image, shifted_boxes, labels
